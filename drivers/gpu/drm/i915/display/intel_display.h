@@ -484,12 +484,20 @@ enum phy_fia {
 		for_each_if(crtc)
 
 #define intel_atomic_crtc_state_for_each_plane_state( \
-		  plane, plane_state, \
-		  crtc_state) \
-	for_each_intel_plane_mask(((crtc_state)->uapi.state->dev), (plane), \
-				((crtc_state)->uapi.plane_mask)) \
-		for_each_if ((plane_state = \
-			      to_intel_plane_state(__drm_atomic_get_current_plane_state((crtc_state)->uapi.state, &plane->base))))
+	plane, iter, plane_state, \
+	crtc_state) \
+	for_each_intel_plane_mask(((crtc_state)->uapi.state->dev), (iter), \
+				  (((crtc_state)->bigjoiner_slave ?	\
+				    intel_atomic_get_new_crtc_state(	\
+					    to_intel_atomic_state((crtc_state)->uapi.state), \
+					    (crtc_state)->bigjoiner_linked_crtc) : \
+				    (crtc_state))->uapi.plane_mask))	\
+	for_each_if ((((plane_state) = \
+		       to_intel_plane_state(__drm_atomic_get_current_plane_state((crtc_state)->uapi.state, &iter->base))), \
+		      ((plane) = (plane_state)->bigjoiner_slave ? (plane_state)->bigjoiner_plane : (iter)), \
+		      ((plane_state) = (plane_state)->bigjoiner_slave ? \
+		       to_intel_plane_state(__drm_atomic_get_current_plane_state((crtc_state)->uapi.state, &plane->base)) : \
+		       (plane_state))))
 
 #define for_each_new_intel_connector_in_state(__state, connector, new_connector_state, __i) \
 	for ((__i) = 0; \

@@ -3718,7 +3718,7 @@ valid_fb:
 	drm_framebuffer_get(fb);
 
 	plane_state->crtc = &intel_crtc->base;
-	intel_plane_copy_uapi_to_hw_state(intel_state, intel_state);
+	intel_plane_copy_uapi_to_hw_state(crtc_state, intel_state, intel_state);
 
 	intel_frontbuffer_flush(to_intel_frontbuffer(fb), ORIGIN_DIRTYFB);
 
@@ -12815,26 +12815,180 @@ static bool check_single_encoder_cloning(struct intel_atomic_state *state,
 	return true;
 }
 
-static int icl_add_linked_planes(struct intel_atomic_state *state)
+static int icl_unset_bigjoiner_plane_links(struct intel_atomic_state *state,
+					   struct intel_crtc_state *new_crtc_state)
 {
-	struct intel_plane *plane, *linked;
-	struct intel_plane_state *plane_state, *linked_plane_state;
-	int i;
+	struct intel_crtc *crtc = to_intel_crtc(new_crtc_state->uapi.crtc);
+	struct intel_plane *plane;
 
-	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
-		linked = plane_state->planar_linked_plane;
+	/*
+	 * Teardown the old bigjoiner plane mappings.
+	 */
+	for_each_intel_plane_on_crtc(crtc->base.dev, crtc, plane) {
+		struct intel_plane_state *plane_state, *other_plane_state;
+		struct intel_plane *other_plane;
 
-		if (!linked)
+		plane_state = intel_atomic_get_plane_state(state, plane);
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+
+		other_plane = plane_state->bigjoiner_plane;
+		if (!other_plane)
 			continue;
 
-		linked_plane_state = intel_atomic_get_plane_state(state, linked);
-		if (IS_ERR(linked_plane_state))
-			return PTR_ERR(linked_plane_state);
+		plane_state->bigjoiner_plane = NULL;
+		plane_state->bigjoiner_slave = false;
 
-		drm_WARN_ON(state->base.dev,
-			    linked_plane_state->planar_linked_plane != plane);
-		drm_WARN_ON(state->base.dev,
-			    linked_plane_state->planar_slave == plane_state->planar_slave);
+		other_plane_state = intel_atomic_get_plane_state(state, other_plane);
+		if (IS_ERR(other_plane_state))
+			return PTR_ERR(other_plane_state);
+		other_plane_state->bigjoiner_plane = NULL;
+		other_plane_state->bigjoiner_slave = false;
+	}
+	return 0;
+}
+
+static int icl_set_bigjoiner_plane_links(struct intel_atomic_state *state,
+					 struct intel_crtc_state *new_crtc_state)
+{
+	struct intel_plane *plane;
+	struct intel_crtc *crtc = to_intel_crtc(new_crtc_state->uapi.crtc);
+	struct intel_crtc *other_crtc = new_crtc_state->bigjoiner_linked_crtc;
+
+	/*
+         * Setup and teardown the new bigjoiner plane mappings.
+         */
+	for_each_intel_plane_on_crtc(crtc->base.dev, crtc, plane) {
+		struct intel_plane_state *plane_state;
+		struct intel_plane *other_plane = NULL;
+		bool found_plane = false;
+
+		plane_state = intel_atomic_get_plane_state(state, plane);
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+
+		for_each_intel_plane_on_crtc(crtc->base.dev, other_crtc, other_plane) {
+			if (other_plane->id != plane->id)
+				continue;
+
+			plane_state->bigjoiner_plane = other_plane;
+			plane_state->bigjoiner_slave = new_crtc_state->bigjoiner_slave;
+
+			plane_state = intel_atomic_get_plane_state(state, other_plane);
+			if (IS_ERR(plane_state))
+				return PTR_ERR(plane_state);
+
+			plane_state->bigjoiner_plane = plane;
+			plane_state->bigjoiner_slave = !new_crtc_state->bigjoiner_slave;
+
+			found_plane = true;
+			break;
+		}
+
+		if (!found_plane) {
+			/* All pipes should have identical planes. */
+			WARN_ON(!found_plane);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static int icl_add_dependent_planes(struct intel_atomic_state *state,
+				    struct intel_plane_state *plane_state)
+{
+	struct intel_plane_state *new_plane_state;
+	struct intel_plane *plane;
+	int ret = 0;
+
+	plane = plane_state->bigjoiner_plane;
+	if (plane && !intel_atomic_get_new_plane_state(state, plane)) {
+		new_plane_state = intel_atomic_get_plane_state(state, plane);
+		if (IS_ERR(new_plane_state))
+			return PTR_ERR(new_plane_state);
+
+		ret = 1;
+	}
+
+	plane = plane_state->planar_linked_plane;
+	if (plane && !intel_atomic_get_new_plane_state(state, plane)) {
+		new_plane_state = intel_atomic_get_plane_state(state, plane);
+		if (IS_ERR(new_plane_state))
+			return PTR_ERR(new_plane_state);
+
+		ret = 1;
+	}
+
+	return ret;
+}
+
+static int icl_add_linked_planes(struct intel_atomic_state *state)
+{
+	struct intel_plane *plane;
+	struct intel_plane_state *old_plane_state, *new_plane_state;
+	struct intel_crtc *crtc, *linked_crtc;
+	struct intel_crtc_state *old_crtc_state, *new_crtc_state, *linked_crtc_state;
+	bool added;
+	int i;
+
+	/*
+	 * Iteratively add plane_state->linked_plane and plane_state->bigjoiner_plane
+	 *
+	 * This needs to be done repeatedly, because of is a funny interaction;
+	 * the Y-plane may be assigned differently on the other bigjoiner crtc,
+	 * and we could end up with the following evil recursion, when only adding a
+	 * single plane to state:
+         *
+	 * XRGB8888 master plane 6 adds NV12 slave Y-plane 6, which adds slave UV plane 0,
+	 * which adds master UV plane 0, which adds master Y-plane 7, which adds XRGB8888
+	 *slave plane 7.
+	 *
+	 * We could pull in even more because of old_plane_state vs new_plane_state.
+	 *
+	 * Max depth = 5 (or 7 for evil case) in this case.
+	 * Number of passes will be less, because newly added planes show up in the
+	 * same iteration round when added_plane->index > plane->index.
+	 */
+	do {
+		added = false;
+
+		for_each_oldnew_intel_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+			int ret, ret2;
+
+			ret = icl_add_dependent_planes(state, old_plane_state);
+			if (ret < 0)
+				return ret;
+
+			ret2 = icl_add_dependent_planes(state, new_plane_state);
+			if (ret2 < 0)
+				return ret2;
+
+			added |= ret || ret2;
+		}
+	} while (added);
+
+	/*
+         * Make sure bigjoiner slave crtc's are also pulled in. This is not done automatically
+         * when adding slave planes, because plane_state->crtc is null.
+         */
+	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+		linked_crtc = old_crtc_state->bigjoiner_linked_crtc;
+		if (linked_crtc) {
+			linked_crtc_state =
+				intel_atomic_get_crtc_state(&state->base, linked_crtc);
+
+			if (IS_ERR(linked_crtc_state))
+				return PTR_ERR(linked_crtc_state);
+		}
+
+		linked_crtc = new_crtc_state->bigjoiner_linked_crtc;
+		if (linked_crtc && linked_crtc != old_crtc_state->bigjoiner_linked_crtc) {
+			linked_crtc_state =
+				intel_atomic_get_crtc_state(&state->base, linked_crtc);
+
+			if (IS_ERR(linked_crtc_state))
+				return PTR_ERR(linked_crtc_state);
+		}
 	}
 
 	return 0;
@@ -12874,6 +13028,7 @@ static int icl_check_nv12_planes(struct intel_crtc_state *crtc_state)
 
 	for_each_new_intel_plane_in_state(state, plane, plane_state, i) {
 		struct intel_plane_state *linked_state = NULL;
+		struct intel_plane_state *master_plane_state;
 
 		if (plane->pipe != crtc->pipe ||
 		    !(crtc_state->nv12_planes & BIT(plane->id)))
@@ -12917,7 +13072,14 @@ static int icl_check_nv12_planes(struct intel_crtc_state *crtc_state)
 		memcpy(linked_state->color_plane, plane_state->color_plane,
 		       sizeof(linked_state->color_plane));
 
-		intel_plane_copy_uapi_to_hw_state(linked_state, plane_state);
+		master_plane_state = plane_state;
+		if (plane_state->bigjoiner_slave)
+			master_plane_state =
+				intel_atomic_get_new_plane_state(state,
+								 plane_state->bigjoiner_plane);
+
+		intel_plane_copy_uapi_to_hw_state(crtc_state, linked_state,
+						  master_plane_state);
 		linked_state->uapi.src = plane_state->uapi.src;
 		linked_state->uapi.dst = plane_state->uapi.dst;
 
@@ -15270,6 +15432,7 @@ static int intel_atomic_check_bigjoiner(struct intel_atomic_state *state,
 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
 	struct intel_crtc_state *slave_crtc_state, *master_crtc_state;
 	struct intel_crtc *slave, *master;
+	int ret;
 
 	/* slave being enabled, is master is still claiming this crtc? */
 	if (old_crtc_state->bigjoiner_slave) {
@@ -15278,6 +15441,12 @@ static int intel_atomic_check_bigjoiner(struct intel_atomic_state *state,
 		master_crtc_state = intel_atomic_get_new_crtc_state(state, master);
 		if (!master_crtc_state || !needs_modeset(master_crtc_state))
 			goto claimed;
+	}
+
+	if (old_crtc_state->bigjoiner) {
+		ret = icl_unset_bigjoiner_plane_links(state, new_crtc_state);
+		if (ret)
+			return ret;
 	}
 
 	if (!new_crtc_state->bigjoiner)
@@ -15304,7 +15473,11 @@ static int intel_atomic_check_bigjoiner(struct intel_atomic_state *state,
 	DRM_DEBUG_KMS("[CRTC:%d:%s] Used as slave for big joiner\n",
 		      slave->base.base.id, slave->base.name);
 
-	return copy_bigjoiner_crtc_state(slave_crtc_state, new_crtc_state);
+	ret = copy_bigjoiner_crtc_state(slave_crtc_state, new_crtc_state);
+	if (ret)
+		return ret;
+
+	return icl_set_bigjoiner_plane_links(state, new_crtc_state);
 
 claimed:
 	DRM_DEBUG_KMS("[CRTC:%d:%s] Slave is enabled as normal CRTC, but "
@@ -16917,7 +17090,7 @@ intel_legacy_cursor_update(struct drm_plane *_plane,
 	new_plane_state->uapi.crtc_w = crtc_w;
 	new_plane_state->uapi.crtc_h = crtc_h;
 
-	intel_plane_copy_uapi_to_hw_state(new_plane_state, new_plane_state);
+	intel_plane_copy_uapi_to_hw_state(new_crtc_state, new_plane_state, new_plane_state);
 
 	ret = intel_plane_atomic_check_with_state(crtc_state, new_crtc_state,
 						  old_plane_state, new_plane_state);

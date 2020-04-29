@@ -594,6 +594,17 @@ struct intel_plane_state {
 	struct intel_plane *planar_linked_plane;
 
 	/*
+	 * bigjoiner_plane:
+	 *
+	 * When 2 pipes are joined in a bigjoiner configuration,
+	 * points to the same plane on the other pipe.
+	 *
+	 * bigjoiner_slave is set on the slave pipe.
+	 */
+	struct intel_plane *bigjoiner_plane;
+	u32 bigjoiner_slave;
+
+	/*
 	 * planar_slave:
 	 * If set don't update use the linked plane's state for updating
 	 * this plane during atomic commit with the update_slave() callback.
