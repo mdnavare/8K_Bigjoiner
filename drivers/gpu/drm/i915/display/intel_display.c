@@ -11479,6 +11479,14 @@ out:
 	return active;
 }
 
+static bool intel_crtc_get_pipe_config(struct intel_crtc *crtc,
+				       struct intel_crtc_state *pipe_config)
+{
+	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+
+	return dev_priv->display.get_pipe_config(crtc, pipe_config);
+}
+
 static u32 intel_cursor_base(const struct intel_plane_state *plane_state)
 {
 	struct drm_i915_private *dev_priv =
@@ -12475,7 +12483,7 @@ intel_encoder_current_mode(struct intel_encoder *encoder)
 		return NULL;
 	}
 
-	if (!dev_priv->display.get_pipe_config(crtc, crtc_state)) {
+	if (!intel_crtc_get_pipe_config(crtc, crtc_state)) {
 		kfree(crtc_state);
 		kfree(mode);
 		return NULL;
@@ -14495,7 +14503,7 @@ verify_crtc_state(struct intel_crtc *crtc,
 	pipe_config->hw.enable = new_crtc_state->hw.enable;
 
 	pipe_config->hw.active =
-		dev_priv->display.get_pipe_config(crtc, pipe_config);
+		intel_crtc_get_pipe_config(crtc, pipe_config);
 
 	/* we keep both pipes enabled on 830 */
 	if (IS_I830(dev_priv) && pipe_config->hw.active)
@@ -18808,7 +18816,7 @@ static void intel_modeset_readout_hw_state(struct drm_device *dev)
 		intel_crtc_state_reset(crtc_state, crtc);
 
 		crtc_state->hw.active = crtc_state->hw.enable =
-			dev_priv->display.get_pipe_config(crtc, crtc_state);
+			intel_crtc_get_pipe_config(crtc, crtc_state);
 
 		crtc->base.enabled = crtc_state->hw.enable;
 		crtc->active = crtc_state->hw.active;
